@@ -735,19 +735,34 @@ class LoopStripCenterCharacter:
             x1, y1 = int(xs.min()), int(ys.min())
             x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
             cropped = frame[y1:y2, x1:x2, :]
+            mask_crop = char_mask[y1:y2, x1:x2]
             ch, cw = cropped.shape[:2]
 
             gray = (cropped.mean(dim=-1).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             faces = face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3,
                                                    minSize=(max(1, cw // 8), max(1, ch // 8)))
-            if len(faces) > 0:
-                fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            # Filter out false-positive cascade detections (faces in the bottom half
+            # of the character are almost certainly armor/body misdetections).
+            valid_faces = [f for f in faces if (f[1] + f[3] // 2) / ch < 0.55]
+
+            if valid_faces:
+                fx, fy, fw, fh = max(valid_faces, key=lambda f: f[2] * f[3])
                 face_cx = fx + fw // 2
                 face_cy = fy + fh // 2
                 method = "anime_cascade"
             else:
-                face_cx = cw // 2
-                face_cy = ch // 2
+                # Fallback: head X from largest blob in top 40% of mask (excludes weapons).
+                # Y: fixed at 43% of character height — matches typical front-view face position,
+                # keeping back/side views consistent with detected front views.
+                head_cutoff = max(1, int(ch * 0.40))
+                head_mask_np = mask_crop[:head_cutoff, :].cpu().numpy().astype(np.uint8)
+                n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(head_mask_np, connectivity=8)
+                if n_labels > 1:
+                    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                    face_cx = int(centroids[largest][0])
+                else:
+                    face_cx = cw // 2
+                face_cy = int(ch * 0.43)
                 method = "fallback"
 
             infos.append((cropped, ch, cw, face_cx, face_cy, method))
