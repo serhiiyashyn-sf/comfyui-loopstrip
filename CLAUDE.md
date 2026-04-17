@@ -37,4 +37,4 @@ Quick version:
 
 - `__pycache__/` is gitignored but ComfyUI doesn't hot-reload — user must restart ComfyUI to pick up code changes.
 - The `lbpcascade_animeface.xml` file MUST be present in the package directory; loaded via `os.path.join(os.path.dirname(__file__), 'lbpcascade_animeface.xml')`.
-- When face detection fails (back/side views), the fallback uses the **head region** (top 30% of mask) for horizontal centering — this ignores weapons/arms extending sideways. Vertical uses 35% of character height (typical chibi face position). Bbox center is NOT a good fallback because extended weapons skew it.
+- When face detection fails (back/side views), the fallback finds the **head blob** (largest connected component in the top 40% of the mask — excludes weapons/fans held low) and uses ITS centroid for both X and Y (eyes ≈ 55% down the head blob for chibi proportions). Using the full bbox's top or a fixed `ch * 0.43` is NOT robust, because accessories held above the head shift the bbox top and misalign the eyes.
