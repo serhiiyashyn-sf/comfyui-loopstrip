@@ -797,10 +797,12 @@ class LoopStripCenterCharacter:
             oy = max(box_top, min(box_bottom - sh, oy))
             oy = max(0, min(oy, output_size - sh))
 
-            # Horizontal: center the character's silhouette (bbox center), not the face.
-            # Asymmetric poses (fan/weapon on one side) would otherwise leave the body
-            # overflowing one edge of the fill box.
-            ox = (output_size - sw) // 2
+            # Horizontal: put the face on the crosshair, but clamp so the silhouette
+            # stays inside the fill box. Symmetric front views land face-on-center;
+            # asymmetric side poses drift until the body hits the box edge, then stop.
+            ox = (output_size // 2) - face_cx_scaled
+            box_left = (output_size - target) // 2
+            ox = max(box_left, min(box_left + target - sw, ox))
             ox = max(0, min(ox, output_size - sw))
 
             canvas = torch.ones(output_size, output_size, c)
