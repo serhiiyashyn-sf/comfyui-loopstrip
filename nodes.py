@@ -921,6 +921,50 @@ class LoopStripSpriteInspector:
         }}
 
 
+# ─── Ensure RGB ─────────────────────────────────────────────────────────────
+
+
+class LoopStripEnsureRGB:
+    """Force any input image to [B, H, W, 3] shape. Fixes downstream nodes that
+    fail on grayscale / alpha / weird channel layouts (e.g. RMBG squeeze bug)."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"image": ("IMAGE",)}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "LoopStrip"
+
+    def execute(self, image):
+        img = image
+        # Normalize shape to [B, H, W, C]
+        if img.dim() == 2:
+            img = img.unsqueeze(-1).unsqueeze(0)  # [H,W] → [1,H,W,1]
+        elif img.dim() == 3:
+            # Either [H,W,C] or [B,H,W] (grayscale batch) — heuristic: if last dim ≤ 4, treat as channels
+            if img.shape[-1] <= 4:
+                img = img.unsqueeze(0)  # [H,W,C] → [1,H,W,C]
+            else:
+                img = img.unsqueeze(-1)  # [B,H,W] → [B,H,W,1]
+
+        b, h, w, c = img.shape
+
+        if c == 1:
+            img = img.repeat(1, 1, 1, 3)
+        elif c == 4:
+            img = img[:, :, :, :3]
+        elif c == 2:
+            img = torch.cat([img, img[:, :, :, :1]], dim=-1)
+        elif c == 3:
+            pass
+        else:
+            img = img[:, :, :, :3] if c > 3 else img.repeat(1, 1, 1, 3 // c + 1)[:, :, :, :3]
+
+        print(f"[LoopStrip] EnsureRGB: {image.shape} → {img.shape}")
+        return (img.contiguous(),)
+
+
 # ─── Registration ───────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
@@ -931,6 +975,7 @@ NODE_CLASS_MAPPINGS = {
     "LoopStripAssemble": LoopStripAssemble,
     "LoopStripSplitGrid": LoopStripSplitGrid,
     "LoopStripSpriteInspector": LoopStripSpriteInspector,
+    "LoopStripEnsureRGB": LoopStripEnsureRGB,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -941,4 +986,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoopStripAssemble": "Loop Strip — Assemble Sprite Strip",
     "LoopStripSplitGrid": "Loop Strip — Split Grid",
     "LoopStripSpriteInspector": "Loop Strip — Sprite Inspector",
+    "LoopStripEnsureRGB": "Loop Strip — Ensure RGB",
 }
