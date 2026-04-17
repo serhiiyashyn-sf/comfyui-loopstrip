@@ -751,22 +751,18 @@ class LoopStripCenterCharacter:
                 face_cy = fy + fh // 2
                 method = "anime_cascade"
             else:
-                # Fallback: find head blob (largest component in top 40% of mask — excludes
-                # weapons/fans held low). Use its centroid for BOTH axes so centering is
-                # pose-invariant: bbox top shifts when characters hold accessories above
-                # their head, but the head blob itself stays put.
+                # Fallback: head X from largest blob in top 40% of mask (excludes weapons).
+                # Y: fixed at 43% of character height — matches typical front-view face position,
+                # keeping back/side views consistent with detected front views.
                 head_cutoff = max(1, int(ch * 0.40))
                 head_mask_np = mask_crop[:head_cutoff, :].cpu().numpy().astype(np.uint8)
                 n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(head_mask_np, connectivity=8)
                 if n_labels > 1:
                     largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-                    hx, hy, hw_, hh_, _ = stats[largest]
                     face_cx = int(centroids[largest][0])
-                    # Eyes sit ~55% down the head blob (chibi: big forehead, eyes lower-middle)
-                    face_cy = hy + int(hh_ * 0.55)
                 else:
                     face_cx = cw // 2
-                    face_cy = int(ch * 0.30)
+                face_cy = int(ch * 0.43)
                 method = "fallback"
 
             infos.append((cropped, ch, cw, face_cx, face_cy, method))
