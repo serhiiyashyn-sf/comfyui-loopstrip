@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-loopstrip"
 description = "Character animation nodes for ComfyUI: walk cycle detection, face-based centering, and sprite strip assembly."
-version = "1.0.1"
+version = "1.1.0"
 license = { file = "LICENSE" }
 dependencies = ["opencv-python", "numpy", "torch", "scipy", "requests"]
 

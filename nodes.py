@@ -850,6 +850,77 @@ class LoopStripSplitGrid:
         return tuple(cells)
 
 
+# ─── Sprite Inspector ───────────────────────────────────────────────────────
+
+
+class LoopStripSpriteInspector:
+    """Interactive sprite inspector + minigame preview inside the node.
+    Connect one IMAGE input per direction (each is a walking cycle batch)."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "fps": ("INT", {"default": 12, "min": 1, "max": 60, "step": 1}),
+            },
+            "optional": {
+                "N": ("IMAGE",),
+                "NE": ("IMAGE",),
+                "E": ("IMAGE",),
+                "SE": ("IMAGE",),
+                "S": ("IMAGE",),
+                "SW": ("IMAGE",),
+                "W": ("IMAGE",),
+                "NW": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "execute"
+    CATEGORY = "LoopStrip"
+
+    def execute(self, fps=12,
+                N=None, NE=None, E=None, SE=None, S=None, SW=None, W=None, NW=None):
+        import hashlib
+
+        dirs_inputs = {"N": N, "NE": NE, "E": E, "SE": SE, "S": S, "SW": SW, "W": W, "NW": NW}
+        temp_dir = folder_paths.get_temp_directory()
+        subfolder = "loopstrip_sprite"
+        out_dir = os.path.join(temp_dir, subfolder)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Hash based on input IDs so we get unique filenames per run
+        run_id = hashlib.md5(str(id(self)).encode()).hexdigest()[:8]
+        import time
+        run_id = f"{int(time.time())}_{run_id}"
+
+        frames_by_dir = {}
+        for dir_name, batch in dirs_inputs.items():
+            if batch is None:
+                frames_by_dir[dir_name] = []
+                continue
+            urls = []
+            n = batch.shape[0]
+            for i in range(n):
+                arr = (batch[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                if arr.shape[-1] == 4:
+                    bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
+                elif arr.shape[-1] == 3:
+                    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                else:
+                    bgr = arr
+                filename = f"{run_id}_{dir_name}_{i:03d}.png"
+                cv2.imwrite(os.path.join(out_dir, filename), bgr)
+                urls.append({"filename": filename, "subfolder": subfolder, "type": "temp"})
+            frames_by_dir[dir_name] = urls
+
+        return {"ui": {
+            "sprite_frames": [frames_by_dir],
+            "fps": [fps],
+        }}
+
+
 # ─── Registration ───────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
@@ -859,6 +930,7 @@ NODE_CLASS_MAPPINGS = {
     "LoopStripCenterCharacter": LoopStripCenterCharacter,
     "LoopStripAssemble": LoopStripAssemble,
     "LoopStripSplitGrid": LoopStripSplitGrid,
+    "LoopStripSpriteInspector": LoopStripSpriteInspector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -868,4 +940,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoopStripCenterCharacter": "Loop Strip — Center Character",
     "LoopStripAssemble": "Loop Strip — Assemble Sprite Strip",
     "LoopStripSplitGrid": "Loop Strip — Split Grid",
+    "LoopStripSpriteInspector": "Loop Strip — Sprite Inspector",
 }
