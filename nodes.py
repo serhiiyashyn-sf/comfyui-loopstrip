@@ -422,12 +422,12 @@ class LoopStripFindCycle:
                     y1 = r * cell_h
                     x1 = col_i * cell_w
                     cell = frames[:, y1:y1 + cell_h, x1:x1 + cell_w, :]
-                    grid_outputs.append(cell[indices])
+                    grid_outputs.append(cell[indices].contiguous().clone())
 
-        # Pad grid outputs to 4
-        empty = torch.zeros(1, 1, 1, c)
+        # Pad grid outputs to 4 with a valid 3-channel tensor (not the full cell size,
+        # but large enough to not break downstream shape handling).
         while len(grid_outputs) < 4:
-            grid_outputs.append(empty)
+            grid_outputs.append(torch.zeros(1, 64, 64, max(3, c)))
 
         return (loop_frames, grid_outputs[0], grid_outputs[1], grid_outputs[2], grid_outputs[3])
 
