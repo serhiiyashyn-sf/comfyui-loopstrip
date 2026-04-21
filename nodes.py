@@ -666,6 +666,13 @@ class LoopStripCenterCharacter:
                 "mask": ("MASK", {
                     "tooltip": "Character mask from BiRefNet/RMBG. If not provided, auto-detects from background.",
                 }),
+                "head_mask": ("MASK", {
+                    "tooltip": "SAM2 mask of the head on ONE reference frame (usually the front view). "
+                               "When provided, centering anchors to feet + fixed head-above-feet offset — "
+                               "works reliably on back/side views where no face is visible.",
+                }),
+                "reference_index": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1,
+                    "tooltip": "Which frame the head_mask corresponds to (usually the front-facing angle)."}),
                 "threshold": ("FLOAT", {"default": 0.12, "min": 0.01, "max": 0.5, "step": 0.01,
                     "tooltip": "Auto-detection threshold (only used when no mask provided)"}),
             },
@@ -677,7 +684,7 @@ class LoopStripCenterCharacter:
     CATEGORY = "LoopStrip"
 
     def execute(self, image, output_size=512, fill_percent=0.55,
-                mask=None, threshold=0.12):
+                mask=None, head_mask=None, reference_index=0, threshold=0.12):
         n, h, w, c = image.shape
 
         # Strip alpha if present (RGBA → RGB)
@@ -705,6 +712,32 @@ class LoopStripCenterCharacter:
         target = int(output_size * fill_percent)
         cascade_path = os.path.join(os.path.dirname(__file__), 'lbpcascade_animeface.xml')
         face_cascade = cv2.CascadeClassifier(cascade_path)
+
+        # ── Head anchor from reference frame (if head_mask provided) ──
+        # Idea: the character's head-above-feet distance is invariant across angles
+        # (same person, just rotated). Measure it once on the reference frame using
+        # SAM2's head mask + the silhouette's feet (bbox bottom), then apply to every
+        # frame via `face_cy = ch - head_height_above_feet`. Works on back views
+        # where no face is visible because we never look at the face — just feet.
+        head_height_above_feet = None
+        if head_mask is not None:
+            hm = head_mask
+            if hm.dim() == 3:
+                hm = hm[min(reference_index, hm.shape[0] - 1)]
+            hm_bool = hm > 0.5
+            hm_ys, hm_xs = torch.where(hm_bool)
+            if len(hm_ys) > 0:
+                head_centroid_y = float(hm_ys.float().mean().item())
+                ref_idx = min(reference_index, n - 1)
+                if use_mask:
+                    ref_char_mask = masks_list[ref_idx] > 0.5
+                else:
+                    ref_char_mask = None
+                if ref_char_mask is not None:
+                    ref_ys, _ = torch.where(ref_char_mask)
+                    if len(ref_ys) > 0:
+                        ref_feet_y = float(ref_ys.max().item())
+                        head_height_above_feet = ref_feet_y - head_centroid_y
 
         # ── Pass 1: detect masks, crops, and faces ──
         infos = []  # (frame, cropped, ch, cw, face_cx, face_cy, method) or None
@@ -737,6 +770,14 @@ class LoopStripCenterCharacter:
             cropped = frame[y1:y2, x1:x2, :]
             mask_crop = char_mask[y1:y2, x1:x2]
             ch, cw = cropped.shape[:2]
+
+            # If head anchor is available, skip detection entirely and use feet+offset.
+            if head_height_above_feet is not None:
+                face_cx = cw // 2
+                face_cy = max(0, min(ch - 1, int(ch - head_height_above_feet)))
+                method = "head_anchor"
+                infos.append((cropped, ch, cw, face_cx, face_cy, method))
+                continue
 
             gray = (cropped.mean(dim=-1).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             faces = face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3,
