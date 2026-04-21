@@ -1178,13 +1178,17 @@ class LoopStripFaceAlignedCenter:
                     "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Vertical position of the face center on the canvas (0=top, 1=bottom). 0.35 puts the face in the upper-third.",
                 }),
+                "use_face_detection": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "OFF (default): always use the silhouette algorithm — head-cx detection from the top of the trimmed body, batch-consistent size. Produces clean results on chibi characters with white BG. ON: also try YOLO face detection where available; batch-median face height drives scale, silhouette head-cx is used as fallback for back views. Only turn on if you've verified face YOLO works well on your character style.",
+                }),
                 "yolo_model": (_FAC_YOLO_FACE_MODELS, {
                     "default": "face_yolov8m.pt",
-                    "tooltip": "Face-detection YOLO model. Looked up in ComfyUI/models/ultralytics/{,bbox}/...",
+                    "tooltip": "Face-detection model (only used when use_face_detection is ON). Looked up in ComfyUI/models/ultralytics/{,bbox}/...",
                 }),
                 "confidence": ("FLOAT", {
                     "default": 0.35, "min": 0.05, "max": 0.95, "step": 0.05,
-                    "tooltip": "YOLO confidence threshold. Lower if sides/3-4 angles aren't being detected.",
+                    "tooltip": "YOLO confidence threshold (only used when use_face_detection is ON). Lower if sides/3-4 angles aren't being detected.",
                 }),
             },
             "optional": {
@@ -1230,18 +1234,23 @@ class LoopStripFaceAlignedCenter:
         empty[dy0 : dy0 + h, dx0 : dx0 + w] = resized_mask[sy0:sy1, sx0:sx1]
         return white, empty
 
-    def execute(self, images, canvas_size, face_fill, face_y, yolo_model, confidence, mask=None):
+    def execute(self, images, canvas_size, face_fill, face_y, use_face_detection,
+                yolo_model, confidence, mask=None):
         N = images.shape[0]
         target_face_h = canvas_size * face_fill
         target_cx = canvas_size / 2.0
         target_cy = canvas_size * face_y
         min_face_px = max(8, int(canvas_size * 0.02))
 
-        yolo, model_path = _fac_load_yolo(yolo_model)
-        if yolo is None:
-            print(f"[LoopStrip] FaceAlignedCenter: YOLO unavailable (model: {yolo_model}). Using silhouette fallback.")
+        if use_face_detection:
+            yolo, model_path = _fac_load_yolo(yolo_model)
+            if yolo is None:
+                print(f"[LoopStrip] FaceAlignedCenter: YOLO requested but unavailable ({yolo_model}). Using silhouette.")
+            else:
+                print(f"[LoopStrip] FaceAlignedCenter: YOLO loaded — {model_path}")
         else:
-            print(f"[LoopStrip] FaceAlignedCenter: YOLO loaded — {model_path}")
+            yolo = None
+            print(f"[LoopStrip] FaceAlignedCenter: silhouette mode (use_face_detection=OFF).")
 
         # Pass 1: detection + silhouette
         infos = []
