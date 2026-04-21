@@ -14,7 +14,7 @@ ComfyUI passes IMAGE tensors as `[N, H, W, C]` float32 in 0..1 range.
 ## Key design decisions
 
 - **Face detection: lbpcascade_animeface** (bundled XML). Heuristic approaches (fixed ratios, width profile / neck detection, skin color, DWPose, eye detection, symmetry) were tried 15+ times and ALL failed on chibi characters. The cascade is the only reliable approach. Don't reintroduce heuristics.
-- **Center Character scaling**: per-image crop-based — `scale = min(target / ch, target / cw)`. Source-image-based scaling was tried and broke when characters had different padding in their source frames.
+- **Center Character scaling**: one scale per BATCH, computed from the max bbox dimensions across all frames (`scale = min(target / max_ch, target / max_cw)`). Per-frame scaling was tried and caused the same character to appear at different sizes across angles (side views have narrower bboxes than front views → drift). Source-image-based scaling (using the full source frame) was also tried and broke when characters had different padding in their source frames — don't reintroduce that either.
 - **Center Character positioning**: face centered on canvas, but clamped so character stays inside the target box (`fill_percent * output_size`).
 - **Find Best Cycle grid mode**: when `grid_cols`/`grid_rows` > 1, the cycle is detected ONCE on the full video, then the same frame indices are applied to each cell (keeps multi-character grids in sync).
 
