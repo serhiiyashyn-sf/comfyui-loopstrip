@@ -767,16 +767,8 @@ class LoopStripCenterCharacter:
 
             infos.append((cropped, ch, cw, face_cx, face_cy, method))
 
-        # ── Global scale: same across every frame so one character stays the
-        # same apparent size across all angles (side views have narrower bboxes
-        # than front views — per-frame scaling would make them drift in size).
-        valid = [info for info in infos if info is not None]
-        if valid:
-            max_ch = max(info[1] for info in valid)
-            max_cw = max(info[2] for info in valid)
-            global_scale = min(target / max_ch, target / max_cw)
-        else:
-            global_scale = 1.0
+        # ── Scale computed per-image from character crop ──
+        scale = None  # computed per image below
 
         # ── Pass 2: scale and position each character ──
         box_top = (output_size - target) // 2
@@ -789,7 +781,7 @@ class LoopStripCenterCharacter:
                 continue
 
             cropped, ch, cw, face_cx, face_cy, method = infos[i]
-            img_scale = global_scale
+            img_scale = min(target / ch, target / cw)
             sh = max(1, int(ch * img_scale))
             sw = max(1, int(cw * img_scale))
 
