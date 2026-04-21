@@ -2,12 +2,14 @@ import json
 import math
 import os
 import tempfile
+from typing import Any
 
 import cv2
 import folder_paths
 import numpy as np
 import requests
 import torch
+import torch.nn.functional as F
 from scipy.signal import find_peaks
 
 VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".gif")
@@ -1011,6 +1013,317 @@ class LoopStripEnsureRGB:
         return (img.contiguous(),)
 
 
+# ─── Face-Aligned Center ─────────────────────────────────────────────────────
+#
+# Batch-aware character centering using YOLO face detection. Detects faces in
+# all N images of a character sheet (typically 8 angles), takes the median
+# face height as a single batch scale reference, and applies the same scale
+# to every image. Result: identical face size across all angles AND across
+# different characters (pinned to `face_fill`).
+#
+# For angles where face detection fails (back / back-3/4 views), falls back
+# to silhouette head-cx detection but still uses the same batch scale, so
+# back views are physically the same size as their face-detected siblings.
+# If ultralytics / the YOLO model is unavailable, falls back entirely to
+# silhouette-based scaling.
+
+_FAC_WHITE_THRESHOLD = 245
+_FAC_ROW_DENSITY_TRIM = 0.25
+_FAC_HEAD_TOP_FRACTION = 0.30
+_FAC_YOLO_FACE_MODELS = ["face_yolov8m.pt", "face_yolov8s.pt", "face_yolov8n.pt"]
+
+
+def _fac_resize(chw, size_hw, mode):
+    return F.interpolate(
+        chw.unsqueeze(0), size=size_hw, mode=mode, align_corners=False
+    ).squeeze(0)
+
+
+def _fac_find_model_path(model_name):
+    try:
+        models_dir = folder_paths.models_dir
+    except Exception:
+        models_dir = None
+    if not models_dir:
+        return None
+    for p in [
+        os.path.join(models_dir, "ultralytics", "bbox", model_name),
+        os.path.join(models_dir, "ultralytics", model_name),
+        os.path.join(models_dir, "yolo", model_name),
+        os.path.join(models_dir, model_name),
+    ]:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _fac_load_yolo(model_name):
+    """Returns (yolo_instance, model_path) or (None, None) if unavailable."""
+    try:
+        from ultralytics import YOLO  # type: ignore
+    except ImportError:
+        return None, None
+    path = _fac_find_model_path(model_name)
+    if path is None:
+        return None, None
+    try:
+        return YOLO(path), path
+    except Exception as e:
+        print(f"[LoopStrip] FaceAlignedCenter: failed to load YOLO {path}: {e}")
+        return None, None
+
+
+def _fac_detect_face(yolo, img_np_uint8, conf, min_size_px):
+    """Return largest-face bbox (x1, y1, x2, y2) or None."""
+    if yolo is None:
+        return None
+    try:
+        results = yolo(img_np_uint8, conf=conf, verbose=False)
+    except Exception as e:
+        print(f"[LoopStrip] FaceAlignedCenter: YOLO inference error: {e}")
+        return None
+    best = None
+    best_area = 0
+    for r in results:
+        if r.boxes is None:
+            continue
+        for box in r.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int).tolist()
+            w, h = x2 - x1, y2 - y1
+            if w < min_size_px or h < min_size_px:
+                continue
+            area = w * h
+            if area > best_area:
+                best_area = area
+                best = (x1, y1, x2, y2)
+    return best
+
+
+def _fac_largest_run_cx(rows):
+    """Median of per-row longest-contiguous-run midpoints. Robust to sideways
+    props (sceptres, swords) that create a separate narrow run beside the main
+    body run."""
+    if rows.size == 0:
+        return None
+    centers = []
+    for row in rows:
+        if not row.any():
+            continue
+        idx = np.flatnonzero(np.diff(np.concatenate([[0], row.astype(np.int8), [0]])))
+        starts = idx[0::2]
+        ends = idx[1::2] - 1
+        if starts.size == 0:
+            continue
+        lengths = ends - starts + 1
+        k = int(np.argmax(lengths))
+        centers.append((int(starts[k]) + int(ends[k])) / 2.0)
+    if not centers:
+        return None
+    return float(np.median(centers))
+
+
+def _fac_silhouette(fg):
+    ys, _ = np.where(fg)
+    if ys.size == 0:
+        return None
+    row_counts = fg.sum(axis=1).astype(np.float32)
+    max_rc = float(row_counts.max())
+    if max_rc <= 0:
+        return None
+    thresh = _FAC_ROW_DENSITY_TRIM * max_rc
+    y_lo = int(ys.min())
+    y_hi = int(ys.max())
+    while y_lo < y_hi and row_counts[y_lo] < thresh:
+        y_lo += 1
+    while y_hi > y_lo and row_counts[y_hi] < thresh:
+        y_hi -= 1
+    body_h = y_hi - y_lo + 1
+    head_y_max = y_lo + max(1, int(round(body_h * _FAC_HEAD_TOP_FRACTION)))
+    head_y_max = min(head_y_max, y_hi)
+
+    head_rows = fg[y_lo : head_y_max + 1]
+    head_cx = _fac_largest_run_cx(head_rows)
+    if head_cx is None:
+        xs_all = np.where(fg[y_lo : y_hi + 1].any(axis=0))[0]
+        head_cx = (
+            (float(xs_all.min()) + float(xs_all.max())) / 2.0
+            if xs_all.size > 0
+            else float(fg.shape[1]) / 2.0
+        )
+
+    return {
+        "body_y_min": y_lo,
+        "body_y_max": y_hi,
+        "head_y_min": y_lo,
+        "head_y_max": head_y_max,
+        "head_cx": head_cx,
+    }
+
+
+class LoopStripFaceAlignedCenter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "canvas_size": ("INT", {
+                    "default": 1024, "min": 64, "max": 8192, "step": 8,
+                    "tooltip": "Square output size (pixels).",
+                }),
+                "face_fill": ("FLOAT", {
+                    "default": 0.18, "min": 0.02, "max": 0.9, "step": 0.01,
+                    "tooltip": "Zoom knob. Face height as a fraction of the canvas. LOWER = zoom out (smaller character, more empty space). HIGHER = zoom in. Same value across every call = same face size for every character sheet.",
+                }),
+                "face_y": ("FLOAT", {
+                    "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Vertical position of the face center on the canvas (0=top, 1=bottom). 0.35 puts the face in the upper-third.",
+                }),
+                "yolo_model": (_FAC_YOLO_FACE_MODELS, {
+                    "default": "face_yolov8m.pt",
+                    "tooltip": "Face-detection YOLO model. Looked up in ComfyUI/models/ultralytics/{,bbox}/...",
+                }),
+                "confidence": ("FLOAT", {
+                    "default": 0.35, "min": 0.05, "max": 0.95, "step": 0.05,
+                    "tooltip": "YOLO confidence threshold. Lower if sides/3-4 angles aren't being detected.",
+                }),
+            },
+            "optional": {
+                "mask": ("MASK", {"tooltip": "Optional foreground mask; overrides white-threshold detection."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("images", "masks", "info")
+    FUNCTION = "execute"
+    CATEGORY = "LoopStrip"
+
+    @staticmethod
+    def _place(img, fg, canvas, scale, src_cx, src_cy, target_cx, target_cy):
+        H, W = fg.shape
+        white = torch.ones((canvas, canvas, 3), dtype=img.dtype, device=img.device)
+        empty = torch.zeros((canvas, canvas), dtype=img.dtype, device=img.device)
+
+        new_H = max(1, int(round(H * scale)))
+        new_W = max(1, int(round(W * scale)))
+
+        img_chw = img.permute(2, 0, 1).contiguous()
+        resized = _fac_resize(img_chw, (new_H, new_W), "bicubic").permute(1, 2, 0).clamp(0.0, 1.0)
+        mask_chw = torch.from_numpy(fg.astype(np.float32)).to(img.device).unsqueeze(0)
+        resized_mask = _fac_resize(mask_chw, (new_H, new_W), "bilinear").squeeze(0).clamp(0.0, 1.0)
+
+        n_cx = src_cx * scale
+        n_cy = src_cy * scale
+        ox = int(round(target_cx - n_cx))
+        oy = int(round(target_cy - n_cy))
+
+        sx0 = max(0, -ox)
+        sy0 = max(0, -oy)
+        sx1 = min(new_W, canvas - ox)
+        sy1 = min(new_H, canvas - oy)
+        if sx1 <= sx0 or sy1 <= sy0:
+            return white, empty
+
+        dx0, dy0 = max(0, ox), max(0, oy)
+        w = sx1 - sx0
+        h = sy1 - sy0
+        white[dy0 : dy0 + h, dx0 : dx0 + w, :] = resized[sy0:sy1, sx0:sx1, :]
+        empty[dy0 : dy0 + h, dx0 : dx0 + w] = resized_mask[sy0:sy1, sx0:sx1]
+        return white, empty
+
+    def execute(self, images, canvas_size, face_fill, face_y, yolo_model, confidence, mask=None):
+        N = images.shape[0]
+        target_face_h = canvas_size * face_fill
+        target_cx = canvas_size / 2.0
+        target_cy = canvas_size * face_y
+        min_face_px = max(8, int(canvas_size * 0.02))
+
+        yolo, model_path = _fac_load_yolo(yolo_model)
+        if yolo is None:
+            print(f"[LoopStrip] FaceAlignedCenter: YOLO unavailable (model: {yolo_model}). Using silhouette fallback.")
+        else:
+            print(f"[LoopStrip] FaceAlignedCenter: YOLO loaded — {model_path}")
+
+        # Pass 1: detection + silhouette
+        infos = []
+        for i in range(N):
+            img_t = images[i][..., :3].contiguous()
+            img_np = (img_t.detach().cpu().numpy() * 255).astype(np.uint8)
+            if mask is not None and mask.shape[0] > i:
+                fg = mask[i].detach().cpu().numpy() > 0.5
+            else:
+                fg = img_np.min(axis=2) < _FAC_WHITE_THRESHOLD
+            face = _fac_detect_face(yolo, img_np, confidence, min_face_px) if yolo is not None else None
+            sil = _fac_silhouette(fg)
+            infos.append({"img": img_t, "fg": fg, "face": face, "sil": sil})
+
+        # Pass 2: batch stats
+        face_hs = [i_["face"][3] - i_["face"][1] for i_ in infos if i_["face"] is not None]
+        used_face_mode = bool(face_hs)
+        if used_face_mode:
+            med = float(np.median(face_hs))
+            filtered = [h for h in face_hs if 0.5 * med <= h <= 2.0 * med]
+            batch_face_h = float(np.median(filtered)) if filtered else med
+            batch_scale = target_face_h / max(batch_face_h, 1.0)
+        else:
+            # No faces anywhere -> derive a scale from silhouette body_h median.
+            # Interpret face_fill as "if face is ~21% of body height (chibi default),
+            # what scale produces that face_fill?" — keeps face_fill as the single
+            # zoom control across both modes.
+            body_hs = [i_["sil"]["body_y_max"] - i_["sil"]["body_y_min"] + 1 for i_ in infos if i_["sil"] is not None]
+            if body_hs:
+                assumed_face_to_body = 0.21
+                target_body_h = min(canvas_size * 0.95, canvas_size * face_fill / assumed_face_to_body)
+                batch_scale = target_body_h / float(np.median(body_hs))
+            else:
+                batch_scale = 1.0
+
+        # Pass 3: placement
+        imgs_out = []
+        masks_out = []
+        info_lines = []
+        if used_face_mode:
+            info_lines.append(f"Batch face height (median) = {batch_face_h:.0f}px source → target {target_face_h:.0f}px (scale {batch_scale:.3f})")
+            info_lines.append(f"Faces detected: {len(face_hs)}/{N}")
+        else:
+            info_lines.append(f"No faces detected across batch. Fallback to silhouette body scale ({batch_scale:.3f}).")
+
+        for i, info in enumerate(infos):
+            img_t = info["img"]
+            fg = info["fg"]
+            face = info["face"]
+            sil = info["sil"]
+
+            if sil is None:
+                imgs_out.append(torch.ones((canvas_size, canvas_size, 3), dtype=img_t.dtype))
+                masks_out.append(torch.zeros((canvas_size, canvas_size), dtype=img_t.dtype))
+                info_lines.append(f"[{i}] empty silhouette — skipped")
+                continue
+
+            if face is not None:
+                fcx = (face[0] + face[2]) / 2.0
+                fcy = (face[1] + face[3]) / 2.0
+                src_tag = f"face ({face[2]-face[0]}×{face[3]-face[1]})"
+            else:
+                fcx = sil["head_cx"]
+                fcy = (sil["head_y_min"] + sil["head_y_max"]) / 2.0
+                src_tag = "silhouette head-cx"
+
+            out_img, out_mask = self._place(
+                img_t, fg, canvas_size, batch_scale,
+                src_cx=fcx, src_cy=fcy,
+                target_cx=target_cx, target_cy=target_cy,
+            )
+            imgs_out.append(out_img)
+            masks_out.append(out_mask)
+            info_lines.append(f"[{i}] {src_tag}  src=({fcx:.0f},{fcy:.0f})")
+
+        return (
+            torch.stack(imgs_out, dim=0),
+            torch.stack(masks_out, dim=0),
+            "\n".join(info_lines),
+        )
+
+
 # ─── Registration ───────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
@@ -1018,6 +1331,7 @@ NODE_CLASS_MAPPINGS = {
     "LoopStripFindCycle": LoopStripFindCycle,
     "LoopStripCenterSubject": LoopStripCenterSubject,
     "LoopStripCenterCharacter": LoopStripCenterCharacter,
+    "LoopStripFaceAlignedCenter": LoopStripFaceAlignedCenter,
     "LoopStripAssemble": LoopStripAssemble,
     "LoopStripSplitGrid": LoopStripSplitGrid,
     "LoopStripSpriteInspector": LoopStripSpriteInspector,
@@ -1029,6 +1343,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoopStripFindCycle": "Loop Strip — Find Best Cycle",
     "LoopStripCenterSubject": "Loop Strip — Center Subject",
     "LoopStripCenterCharacter": "Loop Strip — Center Character",
+    "LoopStripFaceAlignedCenter": "Loop Strip — Face-Aligned Center",
     "LoopStripAssemble": "Loop Strip — Assemble Sprite Strip",
     "LoopStripSplitGrid": "Loop Strip — Split Grid",
     "LoopStripSpriteInspector": "Loop Strip — Sprite Inspector",
